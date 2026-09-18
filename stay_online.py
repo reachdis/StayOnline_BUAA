@@ -3,6 +3,8 @@ StayOnline - BUAA campus network auto-login daemon.
 
 Checks connectivity every 3 minutes and re-authenticates via the
 Srun portal challenge-response protocol when the network is down.
+Monitoring and login are skipped while connected to a Wi-Fi network
+other than BUAA-WiFi / BUAA-Mobile.
 """
 
 import hashlib
@@ -11,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -30,6 +33,8 @@ RETRY_DELAY = 10                  # seconds between retries
 TEST_URL = "https://www.baidu.com"
 GATEWAY_DOMAIN = "gw.buaa.edu.cn"
 AC_ID = 67                       # campus-area id from the user's portal URL
+# Gateway auth is only ever needed on these networks (matched case-insensitively)
+BUAA_SSIDS = {"buaa-wifi", "buaa-mobile"}
 
 # ---------------------------------------------------------------------------
 # Gateway API URLs
@@ -304,6 +309,47 @@ def is_online() -> bool:
     except requests.RequestException:
         return False
 
+
+def get_connected_wifi_ssid() -> str | None:
+    """Return the SSID of the connected Wi-Fi, or None when not on Wi-Fi.
+
+    Parses `netsh wlan show interfaces`. The `SSID` field name is not
+    localized (unlike the rest of the output), so only that line is matched;
+    `BSSID` lines do not match because of the leading-word anchor. None
+    covers wired connections, Wi-Fi off, no wireless adapter, and
+    non-Windows platforms — callers keep the normal behaviour then.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        result = subprocess.run(
+            ["netsh", "wlan", "show", "interfaces"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\s*SSID\s*[:：]\s*(\S.*?)\s*$", line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def is_foreign_wifi_ssid(ssid: str | None) -> bool:
+    """True when on a Wi-Fi that is not a BUAA campus network.
+
+    Gateway authentication only applies to the BUAA network, so a foreign
+    Wi-Fi (hotspot, home router, ...) needs neither monitoring nor login
+    attempts. None (not on Wi-Fi, e.g. wired) is never treated as foreign.
+    """
+    return ssid is not None and ssid.casefold() not in BUAA_SSIDS
+
 # ---------------------------------------------------------------------------
 # Notification helpers
 # ---------------------------------------------------------------------------
@@ -328,6 +374,7 @@ def notify(title: str, message: str) -> None:
             timeout=5,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except Exception as exc:
         log.debug("Toast notification failed: %s", exc)
@@ -403,18 +450,31 @@ def main() -> None:
     online = True  # suppress repeated "Network OK" spam; only log actual events
     next_check_at = time.time()
     last_poll_wall_time = time.time()
+    paused_ssid: str | None = None  # foreign Wi-Fi currently being skipped
 
     while True:
         try:
             now = time.time()
-            if should_run_resume_check(last_poll_wall_time, now):
-                gap = int(now - last_poll_wall_time)
-                log.info("Wake/resume detected after %ds pause", gap)
-                online = validate_network_and_login(username, password, online, "resume")
-                next_check_at = time.time() + CHECK_INTERVAL
-            elif now >= next_check_at:
-                online = validate_network_and_login(username, password, online, "scheduled")
-                next_check_at = time.time() + CHECK_INTERVAL
+            resumed = should_run_resume_check(last_poll_wall_time, now)
+            if resumed or now >= next_check_at:
+                ssid = get_connected_wifi_ssid()
+                if is_foreign_wifi_ssid(ssid):
+                    if paused_ssid != ssid:
+                        log.info("Connected to Wi-Fi %r (not a BUAA network); pausing checks and login", ssid)
+                        paused_ssid = ssid
+                    next_check_at = time.time() + CHECK_INTERVAL
+                else:
+                    if paused_ssid is not None:
+                        log.info("Left non-BUAA Wi-Fi, resuming checks and login")
+                        paused_ssid = None
+                    if resumed:
+                        gap = int(now - last_poll_wall_time)
+                        log.info("Wake/resume detected after %ds pause", gap)
+                        reason = "resume"
+                    else:
+                        reason = "scheduled"
+                    online = validate_network_and_login(username, password, online, reason)
+                    next_check_at = time.time() + CHECK_INTERVAL
         except KeyboardInterrupt:
             log.info("User exit")
             sys.exit(0)
