@@ -7,6 +7,8 @@ Monitoring and login are skipped while connected to a Wi-Fi network
 other than BUAA-WiFi / BUAA-Mobile.
 """
 
+__version__ = "1.0.0"
+
 import hashlib
 import hmac
 import json
@@ -445,7 +447,7 @@ def main() -> None:
         log.error(str(exc))
         sys.exit(1)
 
-    log.info("StayOnline started (check every %ds)", CHECK_INTERVAL)
+    log.info("StayOnline v%s started (check every %ds)", __version__, CHECK_INTERVAL)
 
     online = True  # suppress repeated "Network OK" spam; only log actual events
     next_check_at = time.time()
